@@ -16,6 +16,13 @@ of the contract, not an implementation detail: agents parse it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP `read_note` returns the stored value, not the HTTP banner.** Forwarding the framed
+  `/kv` body into `write_note`'s `if_matches` could never match storage, so a
+  read-modify-write loop never terminated. Matches what `/humans` already strips in
+  `noteValue`.
+
 ## [0.9.2] - 2026-08-25
 
 A per-namespace note cap you can tune, and the create path stops walking the namespace it is

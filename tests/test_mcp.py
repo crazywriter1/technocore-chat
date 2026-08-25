@@ -330,10 +330,19 @@ def test_say_without_a_nick_says_how_to_fix_it(mcp):
     assert "TECHNOCORE_NICK" in text_of(reply)
 
 
+def test_note_value_strips_banner_and_budget_footer():
+    from technocore_mcp.server import _note_value
+
+    assert _note_value("!! UNTRUSTED CONTENT — x\n\nv1") == "v1"
+    assert _note_value("!! UNTRUSTED CONTENT — x\n\nv1\n# budget: 1 of 8 reads left") == "v1"
+    # A body that is not framed (defensive): leave it alone rather than eat content.
+    assert _note_value("plain") == "plain"
+
+
 def test_notes_round_trip_and_a_failed_condition_returns_the_current_value(mcp):
     server, _ = mcp
     call(server, "write_note", {"namespace": "plans", "key": "next", "value": "ship it"})
-    assert "ship it" in text_of(call(server, "read_note", {"namespace": "plans", "key": "next"}))
+    assert text_of(call(server, "read_note", {"namespace": "plans", "key": "next"})) == "ship it"
     assert "next" in text_of(call(server, "list_notes", {"namespace": "plans"}))
     clash = call(
         server,
@@ -343,6 +352,24 @@ def test_notes_round_trip_and_a_failed_condition_returns_the_current_value(mcp):
     # A 409 is information the model can act on — it carries what is actually stored — so
     # it comes back as an error *result*, not a JSON-RPC error the client swallows.
     assert clash["result"]["isError"] is True and "ship it" in text_of(clash)
+
+
+def test_read_note_feeds_write_note_compare_and_set(mcp):
+    """read_note must return the stored value, not the HTTP banner — otherwise if_matches
+    never matches and the RMW loop the tools advertise never terminates. Same contract as
+    /humans noteValue; pin it here so a banner leak fails loudly."""
+    server, _ = mcp
+    call(server, "write_note", {"namespace": "plans", "key": "rmw", "value": "v1"})
+    current = text_of(call(server, "read_note", {"namespace": "plans", "key": "rmw"}))
+    assert current == "v1"
+    assert "UNTRUSTED" not in current
+    ok = call(
+        server,
+        "write_note",
+        {"namespace": "plans", "key": "rmw", "value": "v2", "if_matches": current},
+    )
+    assert ok["result"]["isError"] is False
+    assert text_of(call(server, "read_note", {"namespace": "plans", "key": "rmw"})) == "v2"
 
 
 def test_if_absent_creates_only_once(mcp):
@@ -355,7 +382,7 @@ def test_if_absent_creates_only_once(mcp):
         server, "write_note", {"namespace": "l", "key": "k", "value": "b", "if_absent": True}
     )
     assert second["result"]["isError"] is True
-    assert "a" in text_of(call(server, "read_note", {"namespace": "l", "key": "k"}))
+    assert text_of(call(server, "read_note", {"namespace": "l", "key": "k"})) == "a"
 
 
 def test_discovery_and_room_listing_reach_their_lanes(mcp):
