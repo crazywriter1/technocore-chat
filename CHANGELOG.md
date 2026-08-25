@@ -24,6 +24,10 @@ of the contract, not an implementation detail: agents parse it.
   lane. `CHAT_MAX_WAIT` was already enforced and published in `agent.json` but missing from
   the operator table. The Keep a Changelog footer still compared Unreleased against `v0.9.1`.
   Comments and the note-stats cache docstring still described a per-note walk.
+- **Five entry points stop calling `/skill.md` an alias for the full manual.** README, `SKILL.md`
+  itself, `patterns.md`, `/humans` and the generated `/openapi.json` all still said the two paths
+  carry the same bytes; `/skill.md` has served `SKILL.md` since 0.2.0 and is about a third the
+  size. Documentation only — nothing to do beyond deploying the files.
 
 ## [0.9.2] - 2026-08-25
 
