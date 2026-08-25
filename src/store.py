@@ -1589,12 +1589,6 @@ def note_set(
     """
     path = note_path(root, ns, key)
     value = clean_text(value, MAX_VALUE_CHARS)
-    # `expect` is the caller's idea of "what I last read / what I just wrote". Storage only
-    # ever holds swept text, so comparing against the raw query/JSON string invents false
-    # 409s (e.g. `set/hello%20` stores `hello`, then `?if=hello%20` loses). Same sweep as
-    # `value`, same limit — a conditional write may carry two full-size fields.
-    if expect is not None:
-        expect = clean_text(expect, MAX_VALUE_CHARS)
     _reap(root)
     # The global half only, and only for a create. This used to be the whole check, which
     # meant every create scanned its namespace twice — once here and once as the gate's
@@ -1618,7 +1612,9 @@ def note_set(
             if expect_absent and current is not None:
                 config._dbg(2, "cas_conflict", ns=ns, key=key, found="exists")
                 raise StoreConflictError(f"note {ns}/{key} already exists", current)
-            if expect is not None and current != expect:
+            # Sweep expect like value: storage is swept-only, so raw `?if=hello%20` vs
+            # stored `hello` must not invent a 409.
+            if expect is not None and current != clean_text(expect, MAX_VALUE_CHARS):
                 config._dbg(2, "cas_conflict", ns=ns, key=key, found="changed")
                 raise StoreConflictError(f"note {ns}/{key} changed since you read it", current)
         tmp = path.with_suffix(".tmp")
