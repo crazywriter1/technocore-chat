@@ -120,6 +120,23 @@ def test_cas_rejects_a_write_whose_read_went_stale(client):
     assert "agent-a" in second.text  # 409 hands back the current value to rebase on
 
 
+def test_conditional_if_is_swept_like_the_value(client):
+    """Storage only ever holds swept text. Comparing `?if=` / JSON `if` against the raw
+    string invents a 409 when the caller reuses the same bytes they just wrote
+    (`set/hello%20` stores `hello`, then `?if=hello%20` would lose). Same sweep as value.
+    Not the ZWJ allowlist (#144/#158) and not note JSON framing (#83)."""
+    assert client.get("/kv/plans/sweep-if/set/hello%20").status_code == 200
+    assert "hello" in client.get("/kv/plans/sweep-if").text
+    won = client.get("/kv/plans/sweep-if/set/world?if=hello%20")
+    assert won.status_code == 200, won.text
+    assert "world" in client.get("/kv/plans/sweep-if").text
+
+    assert client.post("/kv/plans/sweep-if-post", json={"value": "hello "}).status_code == 200
+    post = client.post("/kv/plans/sweep-if-post", json={"value": "next", "if": "hello "})
+    assert post.status_code == 200, post.text
+    assert "next" in client.get("/kv/plans/sweep-if-post").text
+
+
 def test_if_absent_creates_exactly_once(client):
     assert client.get("/kv/coord/claim/set/agent-a?if_absent=1").status_code == 200
     assert client.get("/kv/coord/claim/set/agent-b?if_absent=1").status_code == 409

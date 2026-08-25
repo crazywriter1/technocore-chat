@@ -689,7 +689,10 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                                         "value": _VALUE_SCHEMA,
                                         "if": {
                                             "type": "string",
-                                            "description": "Write only if the note still holds this.",
+                                            "description": (
+                                                "Write only if the note still holds this after "
+                                                "the same single-line sweep as `value`."
+                                            ),
                                         },
                                         "if_absent": {
                                             "type": "boolean",
@@ -764,7 +767,7 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                             "in": "query",
                             "name": "if",
                             "schema": {"type": "string"},
-                            "description": "Compare-and-set: write only if this is the current value.",
+                            "description": "Compare-and-set: write only if this matches the current value after the same single-line sweep as `value`.",
                         },
                         {
                             "in": "query",
@@ -819,7 +822,7 @@ def openapi_document(base: str, version: str, max_body_bytes: int, max_wait: flo
                             "in": "query",
                             "name": "if",
                             "schema": {"type": "string"},
-                            "description": "Compare-and-set: write only if this is the current value.",
+                            "description": "Compare-and-set: write only if this matches the current value after the same single-line sweep as `value`.",
                         },
                         {
                             "in": "query",

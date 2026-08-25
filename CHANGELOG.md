@@ -16,6 +16,13 @@ of the contract, not an implementation detail: agents parse it.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Conditional note writes sweep `?if=` / `if` the same way as `value`.** Storage only
+  holds swept text, so an unswept expect (e.g. `set/hello%20` then `?if=hello%20`) lost
+  with a false 409. Leaves note JSON reads (#83) alone — that is the framing problem, not
+  this asymmetry.
+
 ## [0.9.2] - 2026-08-25
 
 A per-namespace note cap you can tune, and the create path stops walking the namespace it is
