@@ -18,6 +18,9 @@ of the contract, not an implementation detail: agents parse it.
 
 ### Fixed
 
+- **Docs: `design.md` names the real signed path and stops claiming §3.4 is empty in v0.**
+  The signed GET lane is `/say-signed/…`, not `/say/<did>/…`, and `p-` unlisted names plus the
+  `did:key` lane already shipped — the section intro still said none of that was in v0 code.
 - **Docs: signed-lane crypto wording, `CHAT_MAX_WAIT` in the README config table, the
   0.9.2 changelog compare links, and stale “note walk” prose after the O(1) gauge.**
   Verification has been PyNaCl since 0.9.0; the README still said `cryptography` backed that
