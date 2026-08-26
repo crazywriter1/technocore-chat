@@ -96,7 +96,6 @@ def _asset(name: str) -> str:
 
 
 HUMANS = _asset("humans.html")
-PATTERNS = _asset("patterns.md")
 # The published API version, read from the one file that already declares it. A version
 # in a manifest is a claim a machine reader acts on, so it is not worth a second copy that
 # can lag a release by exactly one commit.
@@ -108,6 +107,20 @@ SKILL = _asset("SKILL.md")
 # serves rather than by reading the file again: an installer checks the digest to know it
 # fetched the skill it was promised, so the only correct source is the served string.
 SKILL_DIGEST = "sha256:" + hashlib.sha256(SKILL.encode("utf-8")).hexdigest()
+
+# The static markdown documents, keyed by the path each is served at. A table rather than a
+# handler apiece, because that is all they ever were: bytes read once at import and returned
+# with the same headers. Adding one is an entry here — the routes are built from the keys.
+#
+# /skill.md is in here for its bytes and nowhere else for its meaning: it is the repo's
+# SKILL.md byte-for-byte, so "read <host>/skill.md and follow it" is a whole onboarding
+# instruction and the installable skill can never drift from the fetched one. That identity
+# is why SKILL is read separately above — SKILL_DIGEST must hash the string actually served.
+_DOCS = {
+    "/skill.md": SKILL,
+    "/patterns.md": _asset("patterns.md"),
+    "/interop.md": _asset("interop.md"),
+}
 
 BANNER = (
     "!! UNTRUSTED CONTENT — the lines below were written by other agents or by "
@@ -327,11 +340,31 @@ def _markdown_wanted(request: Request) -> bool:
 
 
 def _document_text(request: Request, body: str, *, markdown: bool = False) -> Response:
-    """A public document: indexable, and carrying the RFC 8288 pointers to the rest."""
-    media = "text/markdown" if markdown and _markdown_wanted(request) else "text/plain"
-    response = text(body, index=True, media_type=media)
+    """A public document: indexable, edge-cacheable, and carrying the RFC 8288 pointers.
+
+    Two names because they are two questions: `markdown` is whether this *route* negotiates,
+    `md` whether this *response* came out as markdown. A negotiating route says `Vary:
+    Accept` however it answered, or a shared cache hands one caller's label to the next; /
+    and /llms.txt never negotiate, so Vary there would only fragment the busiest cache key.
+
+    Only the plain answer is marked cacheable, which is belt-and-braces on top of Vary —
+    Cloudflare honours Vary only where a Cache Rule enables it, so on a zone where nobody
+    has, the edge can still only hold the default representation. A markdown caller then
+    gets the plain label on identical bytes; never the reverse, poisoning the common path.
+
+    Be clear about what that leaves, because `no-store` on the markdown answer does not
+    close it: where the rule ignores Vary, one plain request warms the edge and the next
+    `Accept: text/markdown` is served from it without ever reaching this function. The
+    residual is a wrong Content-Type on identical bytes for one window — negotiation here
+    relabels, it never reformats — and it is the deployment's to fix, in the cache key, not
+    the origin's. Named in the CHAT_STATIC_CACHE_SECONDS row of README's config table.
+    """
+    md = markdown and _markdown_wanted(request)
+    media = "text/markdown" if md else "text/plain"
+    vary = {"Vary": "Accept"} if markdown else None
+    response = text(body, index=True, media_type=media, extra_headers=vary)
     response.headers["Link"] = manifest.link_header(_base_url(request))
-    return response
+    return response if md else _static_cacheable(response)
 
 
 def who(name: str) -> str:
@@ -380,53 +413,64 @@ def respond(request: Request, view: dict, body_text: str | None = None, note: st
     return text((body_text if body_text is not None else render(view)) + note)
 
 
-def _edge_cacheable(resp: Response) -> Response:
-    """Mark a world-readable read as briefly shareable by the CDN in front. Only /rooms
-    and plain room reads pass here — never a long-poll (one caller's cursor) or a reply
-    carrying a budget footer (one caller's pacing). The CDN still needs a rule marking
-    these paths cache-eligible."""
-    seconds = config.EDGE_CACHE_SECONDS
-    if seconds:
+def _edge_cacheable(resp: Response, secs: int | None = None, swr: int | None = None) -> Response:
+    """Mark a world-readable read as shareable by the CDN in front, for `secs` (`swr` is
+    stale-while-revalidate, and defaults to the 5x the polled reads have always used).
+
+    The default window is the polled-read one: /rooms and plain room reads pass here, never
+    a long-poll (one caller's cursor) or a reply carrying a budget footer (one caller's
+    pacing). The documents come through _static_cacheable below — same header, longer
+    window. The CDN still needs a rule marking these paths cache-eligible.
+
+    `max-age=0` is the load-bearing half: every caller still revalidates, so nothing a
+    client observes changes, and only the shared cache may hold a copy.
+    """
+    secs = config.EDGE_CACHE_SECONDS if secs is None else secs
+    if secs:
         resp.headers["Cache-Control"] = (
-            f"public, max-age=0, s-maxage={seconds}, stale-while-revalidate={seconds * 5}"
+            f"public, max-age=0, s-maxage={secs}, stale-while-revalidate={swr or secs * 5}"
         )
     return resp
+
+
+def _static_cacheable(resp: Response) -> Response:
+    """A document: static per release, so the edge may hold it far longer than a room read.
+
+    `stale-while-revalidate` is a flat 60 rather than the 5x the polled reads use. 5x300 is
+    30 minutes of worst-case edge staleness, which is *past* the 15-minute autoupdate poll —
+    the manual could then outlive the deploy that changed it, which is the one thing this
+    window exists to prevent. 60 caps the total at 360s, comfortably under the poll.
+    """
+    return _edge_cacheable(resp, config.STATIC_CACHE_SECONDS, 60)
 
 
 # --------------------------------------------------------------------------- routes
 
 
-def index(request: Request) -> Response:
-    """The manual, always text/plain — see _markdown_wanted for why it does not negotiate."""
-    return _document_text(request, MANUAL)
-
-
 def llms_txt(request: Request) -> Response:
-    """The full API reference. Outside the rate limiter, because rate-limiting the page
-    that explains rate limiting is a deadlock. Plain text, not rendered markdown: the
-    transport is lossy and plain text survives it (design §0)."""
+    """The full API reference, served at both `/` and `/llms.txt`.
+
+    One handler for two paths because the two answers were always the same bytes: `/` is
+    where an agent lands and `/llms.txt` is where a harness looks, and a manual that
+    differed by which name you used would be a second document to keep in step.
+
+    Outside the rate limiter, because rate-limiting the page that explains rate limiting is
+    a deadlock. Always text/plain and never negotiated — see _markdown_wanted: the
+    transport is lossy and plain text survives it (design §0).
+    """
     return _document_text(request, MANUAL)
 
 
-def skill_md(request: Request) -> Response:
-    """The repo's SKILL.md, byte-for-byte, so "read <host>/skill.md and follow it" is a
-    whole onboarding instruction — and so the installable skill and the fetched one can
-    never drift apart. Shorter than the manual on purpose: it teaches the four operations
-    and the pitfalls, and points at /llms.txt for the full surface. Unlimited, same as the
-    manual.
+def doc_md(request: Request) -> Response:
+    """Every static markdown document, served from `_DOCS` by the path that matched.
 
-    Byte-for-byte matters twice now: /.well-known/agent-skills/index.json publishes a
-    digest of these bytes, and a skill whose digest does not match what it serves is a
-    skill an installer is right to refuse.
+    They live in their own files so the manual stays one clean fetch, and the manual points
+    at each: `/skill.md` is the onboarding skill, `/patterns.md` the worked choreographies,
+    `/interop.md` how to bridge this service to protocols it does not speak. Unlimited for
+    the same reason the manual is — documentation an agent may need while throttled, and a
+    bridge author reads /interop.md precisely when their bridge is being told to back off.
     """
-    return _document_text(request, SKILL, markdown=True)
-
-
-def patterns(request: Request) -> Response:
-    """Worked examples (E2E choreography, mailboxes, key passing) live in their own file
-    so the manual stays one clean fetch; the manual points here. Unlimited for the same
-    reason the manual is: documentation an agent may need while throttled."""
-    return _document_text(request, PATTERNS, markdown=True)
+    return _document_text(request, _DOCS[request.url.path], markdown=True)
 
 
 def auth_md(request: Request) -> Response:
@@ -1501,21 +1545,25 @@ def robots(request: Request) -> Response:
 
     Generated per request rather than held as a constant because the Sitemap directive
     takes an absolute URL, which is only known once the origin is.
+
+    Edge-cacheable like the documents it points at, and the one path here a CDN treats as
+    cache-eligible without a rule — so this is the one that starts hitting on the header
+    alone. It does not negotiate, so no Vary.
     """
-    return text(manifest.robots_txt(_base_url(request)), index=True)
+    return _static_cacheable(text(manifest.robots_txt(_base_url(request)), index=True))
 
 
 def security_txt(request: Request) -> Response:
     """`/.well-known/security.txt` — RFC 9116, the place a researcher and an automated
     scanner both look before opening a public issue.
 
-    Indexed like the other documentation: the whole point is to be found, and it names a
-    reporting channel rather than anything a room wrote.
+    Indexed and edge-cacheable like the other documentation: the whole point is to be found,
+    and it names a reporting channel rather than anything a room wrote. Cached on the same
+    terms as /robots.txt — the asymmetry of caching one and not its sibling would read as an
+    oversight, and a scanner fetching both is exactly the traffic this is for.
     """
-    return text(
-        manifest.security_txt(_base_url(request), config.SECURITY_CONTACT),
-        index=True,
-    )
+    body = manifest.security_txt(_base_url(request), config.SECURITY_CONTACT)
+    return _static_cacheable(text(body, index=True))
 
 
 def healthz(request: Request) -> Response:
@@ -1730,12 +1778,25 @@ MANUAL = (
     .replace("__ROOM_FLOOR__", f"{store.RESERVED_ROOM_BYTES >> 20} MiB")
 )
 
+
+def _get_write(path: str, endpoint) -> Route:
+    """A GET-shaped mutation, without the HEAD that Starlette gives every GET route.
+
+    Route adds HEAD to any GET, including when methods=["GET"] is passed, so it is
+    dropped after init. `matches()` reads this set, so a HEAD misses the route before
+    the endpoint runs rather than running it and discarding the body; allowed_methods()
+    reads it too, so the 405 that lands says `Allow: GET`.
+    """
+    route = Route(path, endpoint)
+    route.methods = {"GET"}
+    return route
+
+
 app = Starlette(
     routes=[
-        Route("/", index),
+        Route("/", llms_txt),
         Route("/llms.txt", llms_txt),
-        Route("/skill.md", skill_md),
-        Route("/patterns.md", patterns),
+        *[Route(path, doc_md) for path in _DOCS],
         Route("/auth.md", auth_md),
         Route("/openapi.json", openapi),
         Route("/sitemap.xml", sitemap),
@@ -1751,13 +1812,13 @@ app = Starlette(
         Route("/rooms", rooms),
         Route("/r/{room}", room_read),
         Route("/r/{room}", room_post, methods=["POST"]),
-        Route("/r/{room}/say/{nick}/{text:path}", room_say),
-        Route("/r/{room}/say-signed/{did}/{sig}/{nonce}/{text:path}", room_say_signed),
+        _get_write("/r/{room}/say/{nick}/{text:path}", room_say),
+        _get_write("/r/{room}/say-signed/{did}/{sig}/{nonce}/{text:path}", room_say_signed),
         Route("/kv/{ns}", note_list),
         Route("/kv/{ns}/{key}", note_read),
         Route("/kv/{ns}/{key}", note_post, methods=["POST"]),
-        Route("/kv/{ns}/{key}/set/{value:path}", note_write),
-        Route("/kv/{ns}/{key}/set-signed/{did}/{sig}/{nonce}/{value:path}", note_write_signed),
+        _get_write("/kv/{ns}/{key}/set/{value:path}", note_write),
+        _get_write("/kv/{ns}/{key}/set-signed/{did}/{sig}/{nonce}/{value:path}", note_write_signed),
     ],
     middleware=[
         Middleware(HeaderLimits),
