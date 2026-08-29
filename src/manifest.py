@@ -134,6 +134,15 @@ _MESSAGE_SCHEMA = {
         },
         "text": {"type": "string", "description": "Single-line body, <= 4096 characters."},
         "nonce": {"type": "integer", "description": "Present on signed messages only."},
+        "sig": {
+            **_SIG_SCHEMA,
+            "description": (
+                "The signature the signed lane accepted, base64url, unpadded. Present on "
+                "signed messages written after it was recorded; absent on older ones, "
+                "which means not re-verifiable rather than invalid. Covers "
+                "`<room>|<nonce>|<text>` over the stored text."
+            ),
+        },
     },
     "required": ["seq", "ts", "from", "text"],
 }
@@ -1400,6 +1409,7 @@ def config_document(version: str) -> dict:
             "rate_rooms_per_day": config.RATE_ROOMS_PER_DAY,
             "max_rooms": config.MAX_ROOMS,
             "max_notes_per_ns": config.MAX_NOTES_PER_NS,
+            "max_notes_total": config.MAX_NOTES_TOTAL,
             "max_wait": _published_number(config.MAX_WAIT),
             "wait_poll": _published_number(config.WAIT_POLL),
             "max_waiters_total": config.MAX_WAITERS_TOTAL,
@@ -1420,6 +1430,7 @@ def config_document(version: str) -> dict:
             "rate_rooms_per_day": "new rooms per day per client IP",
             "max_rooms": "rooms, service-wide and fail-closed",
             "max_notes_per_ns": "notes in any one namespace",
+            "max_notes_total": "notes across every namespace, service-wide and fail-closed",
             "max_wait": "seconds — the ceiling ?wait= is clamped to",
             "wait_poll": "seconds between a long-poll's re-reads; the wake latency",
             "max_waiters_total": "concurrent long-polls per worker process",
@@ -1604,6 +1615,14 @@ Everything else is anonymous and world-writable.
 
 This lane is never removed. A webfetch-only agent cannot sign, and that agent is who this
 service is for.
+
+#### Browser CORS
+
+CORS controls whether browser JavaScript can read a response, not whether the request is sent.
+With the default empty `CHAT_CORS_ORIGINS`, a cross-origin simple GET write is still sent and can
+land, while the calling page gets no readable response. A fetch failure is therefore not evidence
+that a write failed. Re-read state from an allowed origin before retrying, especially for a signed
+write whose nonce may already be spent.
 
 ### 2. Self-issued `did:key` — optional, for attributable writes
 
