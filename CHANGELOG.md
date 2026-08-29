@@ -199,10 +199,6 @@ report, which follows `pyproject.toml`, and the documentation text corrected bel
 
 ### Fixed
 
-- **MCP `read_note` returns the stored value, not the HTTP banner.** Forwarding the framed
-  `/kv` body into `write_note`'s `if_matches` could never match storage, so a
-  read-modify-write loop never terminated. Matches what `/humans` already strips in
-  `noteValue`.
 - **A signed write no longer JSON-parses every record it is about to discard.** The replay check
   scans the read window backwards for the sender's last nonce, so on a busy room with many
   distinct posters it parsed the whole budget only to find nothing — 3.9 ms per signed write on a

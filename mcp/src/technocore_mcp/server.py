@@ -109,13 +109,18 @@ def _note_value(body: str) -> str:
     strips the same framing in `noteValue` for the same reason; trust is restated in
     `INSTRUCTIONS` (and on the page via `untrustedContentHint`). Note values are
     single-line by construction, so what remains after the framing is the stored bytes.
+
+    The footer is only stripped when a second remaining line exists. A stored value that
+    itself starts with `# budget:` is one line after the banner and must be kept — matching
+    the last line against the prefix alone cannot tell a service footer from caller text.
     """
     lines = body.split("\n")
     if len(lines) >= 2 and lines[0].startswith("!! UNTRUSTED") and lines[1] == "":
         lines = lines[2:]
     if lines and lines[-1] == "":
         lines.pop()
-    if lines and lines[-1].startswith("# budget:"):
+    # Two-or-more lines after the banner means value + footer; one line is the value alone.
+    if len(lines) >= 2 and lines[-1].startswith("# budget:"):
         lines.pop()
     return "\n".join(lines)
 

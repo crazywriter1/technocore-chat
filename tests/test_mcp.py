@@ -335,8 +335,23 @@ def test_note_value_strips_banner_and_budget_footer():
 
     assert _note_value("!! UNTRUSTED CONTENT — x\n\nv1") == "v1"
     assert _note_value("!! UNTRUSTED CONTENT — x\n\nv1\n# budget: 1 of 8 reads left") == "v1"
+    # A legal stored value that starts with the footer prefix must survive when no footer
+    # was appended — otherwise if_matches against "" stalls the same RMW loop this strip
+    # exists to unstick (review on #183).
+    assert (
+        _note_value("!! UNTRUSTED CONTENT — x\n\n# budget: my notes for today")
+        == "# budget: my notes for today"
+    )
+    assert (
+        _note_value(
+            "!! UNTRUSTED CONTENT — x\n\n# budget: my notes for today\n"
+            "# budget: 1 of 8 reads left"
+        )
+        == "# budget: my notes for today"
+    )
     # A body that is not framed (defensive): leave it alone rather than eat content.
     assert _note_value("plain") == "plain"
+    assert _note_value("# budget: bare") == "# budget: bare"
 
 
 def test_notes_round_trip_and_a_failed_condition_returns_the_current_value(mcp):
@@ -370,6 +385,31 @@ def test_read_note_feeds_write_note_compare_and_set(mcp):
     )
     assert ok["result"]["isError"] is False
     assert text_of(call(server, "read_note", {"namespace": "plans", "key": "rmw"})) == "v2"
+
+
+def test_read_note_cas_survives_a_value_that_looks_like_the_budget_footer(mcp):
+    """A stored value starting with `# budget:` is legal; stripping it to "" would stall
+    if_matches the same way the banner leak did. Round-trip through HTTP framing."""
+    server, _ = mcp
+    value = "# budget: my notes for today"
+    call(server, "write_note", {"namespace": "plans", "key": "lookalike", "value": value})
+    current = text_of(call(server, "read_note", {"namespace": "plans", "key": "lookalike"}))
+    assert current == value
+    ok = call(
+        server,
+        "write_note",
+        {
+            "namespace": "plans",
+            "key": "lookalike",
+            "value": value + "!",
+            "if_matches": current,
+        },
+    )
+    assert ok["result"]["isError"] is False
+    assert (
+        text_of(call(server, "read_note", {"namespace": "plans", "key": "lookalike"}))
+        == value + "!"
+    )
 
 
 def test_if_absent_creates_only_once(mcp):
