@@ -344,8 +344,7 @@ def test_note_value_strips_banner_and_budget_footer():
     )
     assert (
         _note_value(
-            "!! UNTRUSTED CONTENT — x\n\n# budget: my notes for today\n"
-            "# budget: 1 of 8 reads left"
+            "!! UNTRUSTED CONTENT — x\n\n# budget: my notes for today\n# budget: 1 of 8 reads left"
         )
         == "# budget: my notes for today"
     )
