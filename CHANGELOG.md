@@ -335,9 +335,6 @@ report, which follows `pyproject.toml`, and the documentation text corrected bel
 
 ### Fixed
 
-- **Docs: `design.md` names the real signed path and stops claiming §3.4 is empty in v0.**
-  The signed GET lane is `/say-signed/…`, not `/say/<did>/…`, and `p-` unlisted names plus the
-  `did:key` lane already shipped — the section intro still said none of that was in v0 code.
 - **A signed write no longer JSON-parses every record it is about to discard.** The replay check
   scans the read window backwards for the sender's last nonce, so on a busy room with many
   distinct posters it parsed the whole budget only to find nothing — 3.9 ms per signed write on a
