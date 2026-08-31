@@ -1273,6 +1273,11 @@ def test_every_sitemap_url_is_one_the_crawler_is_allowed_to_index(client):
     than a room, but what it lists is anonymous and non-durable, so it stays out."""
     import manifest
 
+    assert {
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/mcp/server-card.json",
+    } <= set(manifest.SITEMAP_PATHS)
     for path in manifest.SITEMAP_PATHS:
         response = client.get(path)
         assert response.status_code == 200, f"{path} is listed but not served"
@@ -1404,13 +1409,18 @@ def test_the_manual_is_not_markdown_and_so_is_never_labelled_as_such(client):
 
 
 def test_the_ai_catalog_lists_only_artifacts_that_resolve(client):
-    """A catalog exists to resolve to real things. Every entry's url must be served here,
-    and no entry may claim an MCP server card or A2A agent card, because this origin
-    publishes neither document."""
+    """A catalog exists to resolve to real things, and that is the invariant: every entry's
+    url must be served by this origin.
+
+    The MCP server card is now one of them, and its presence here is not a claim that this
+    origin speaks MCP — the catalog resolves to the card, and the card names an endpoint on
+    another host. The A2A agent card stays absent because no such document exists to point
+    at; if one is ever added, it is the loop below, not this line, that has to keep passing.
+    """
     doc = client.get("/.well-known/ai-catalog.json").json()
     assert doc["specVersion"] == "1.0" and doc["host"]["displayName"]
     types = {e["type"] for e in doc["entries"]}
-    assert "application/mcp-server-card+json" not in types
+    assert "application/mcp-server-card+json" in types
     assert "application/a2a-agent-card+json" not in types
     assert "application/agent-skills+md" in types
     for entry in doc["entries"]:
@@ -1438,10 +1448,59 @@ def test_the_static_documents_are_edge_cacheable_and_the_header_is_exact(client)
     assert client.get("/").headers["cache-control"] == static
 
     documents = ("/", "/llms.txt", "/skill.md", "/patterns.md", "/interop.md", "/auth.md")
-    for path in (*documents, "/robots.txt", "/.well-known/security.txt"):
+    # The JSON documents carry the same policy and are listed here rather than left to a
+    # separate test, because "which paths may the edge hold" is one question. They used to
+    # carry a hardcoded `max-age=3600` instead — a client-side hour on documents whose whole
+    # purpose is being refetched — and nothing named them, which is how the two policies
+    # drifted apart unnoticed. /sitemap.xml is in the list for the same reason.
+    machine_readable = (
+        "/openapi.json",
+        "/config",
+        "/sitemap.xml",
+        "/.well-known/agent.json",
+        "/.well-known/api-catalog",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/mcp/server-card.json",
+    )
+    for path in (*documents, *machine_readable, "/robots.txt", "/.well-known/security.txt"):
         cc = client.get(path).headers["cache-control"]
-        assert "s-maxage=" in cc, path
+        assert cc == static, path
         assert "no-store" not in cc, path
+
+
+def test_a_zero_window_means_not_cached_rather_than_cached_without_a_bound(client):
+    """`0` disables, and disabling has to fail closed.
+
+    `_edge_cacheable` sets a header only for a truthy window, so with the knob at zero it
+    returns the response exactly as built. That makes the *initial* header the contract for
+    the disabled case: `text()` starts every response `no-store`, so the prose documents
+    fall back to it, and a bare `Response` would fall back to no `Cache-Control` at all —
+    which does not mean "do not cache", it means a cache may hold it heuristically for as
+    long as it likes, and a CDN rule marking the path eligible would do exactly that.
+
+    So the disabled setting is asserted here for both halves of the document set together.
+    The prose side has always been right; the JSON side was not until the header was seeded
+    before `_static_cacheable` could decline to overwrite it.
+    """
+    import config
+
+    both = (
+        "/llms.txt",
+        "/robots.txt",
+        "/.well-known/security.txt",
+        "/openapi.json",
+        "/config",
+        "/sitemap.xml",
+        "/.well-known/agent.json",
+        "/.well-known/api-catalog",
+        "/.well-known/ai-catalog.json",
+        "/.well-known/agent-skills/index.json",
+        "/.well-known/mcp/server-card.json",
+    )
+    with config.override(STATIC_CACHE_SECONDS=0):
+        for path in both:
+            assert client.get(path).headers["cache-control"] == "no-store", path
 
 
 def test_the_per_caller_and_liveness_surfaces_are_never_edge_cacheable(client):
@@ -1533,3 +1592,72 @@ def test_the_response_schema_publishes_the_sig_it_now_returns(client):
     # Optional, not required: records written before the field existed have no `sig`, and a
     # reader must read that as "not re-verifiable", never as "invalid".
     assert "sig" not in message["required"]
+
+
+def test_the_mcp_server_card_is_served_and_conforms_to_the_extension_schema(client):
+    """`/.well-known/mcp/server-card.json` — SEP-2127's four required fields and the
+    constraints its schema puts on them, asserted here rather than by fetching the schema.
+
+    The schema is unratified and lives outside this repo, so a network fetch would make
+    this suite depend on a draft moving under it. What is pinned instead is the contract as
+    of the SEP-review snapshot: `$schema`, `name`, `version` and `description` are required;
+    `name` is reverse-DNS with exactly one slash; `description` is capped at 100 characters;
+    a remote's `type` is one of two strings. Those are the ways a card is invalid rather
+    than merely unfashionable, and they are cheap to keep true.
+    """
+    card = client.get("/.well-known/mcp/server-card.json")
+    assert card.status_code == 200
+    assert card.headers["content-type"].startswith("application/json")
+    doc = card.json()
+
+    for required in ("$schema", "name", "version", "description"):
+        assert doc.get(required), required
+    assert doc["$schema"] == (
+        "https://static.modelcontextprotocol.io/schemas/v1/server-card.schema.json"
+    )
+    assert re.fullmatch(r"[a-zA-Z0-9.-]+/[a-zA-Z0-9._-]+", doc["name"]), doc["name"]
+    assert 3 <= len(doc["name"]) <= 200
+    assert 1 <= len(doc["description"]) <= 100, len(doc["description"])
+
+    (remote,) = doc["remotes"]
+    assert remote["type"] == "streamable-http"  # the enum's other member is the dead `sse`
+    assert remote["url"].startswith("https://")
+    assert remote["supportedProtocolVersions"]
+
+
+def test_the_server_card_reports_the_running_version_and_the_handshake_name(client):
+    """Two names on one card, and they are answers to different questions.
+
+    `name` is the registry identity the schema's reverse-DNS pattern demands. `serverInfo`
+    is what the wrapper actually answers with at `initialize`, which is a plain string and
+    would fail that pattern. Neither can be derived from the other, so both are published
+    and this pins that they stay distinct rather than being collapsed into one.
+
+    `version` is this service's release. The card does not claim to be the wrapper's PyPI
+    version — those have diverged before — which is why this asserts against /config rather
+    than against anything in mcp/.
+    """
+    doc = client.get("/.well-known/mcp/server-card.json").json()
+    assert doc["version"] == client.get("/config").json()["version"]
+    assert doc["serverInfo"]["version"] == doc["version"]
+    assert doc["serverInfo"]["name"] == "technocore-chat"
+    assert doc["serverInfo"]["name"] != doc["name"]
+    assert doc["capabilities"]["tools"] == {"listChanged": False}
+
+
+def test_the_card_and_the_registry_manifest_name_the_same_server(client):
+    """`mcp/server.json` and the card describe one server from two formats, and both live
+    in this repo — so a drift between them is a thing this suite can prevent rather than
+    discover in production. The endpoint especially: the card is how an agent finds it and
+    the manifest is how a registry does, and an agent sent somewhere the registry does not
+    know about is worse than either document alone.
+    """
+    manifest_path = Path(__file__).resolve().parents[2] / "mcp" / "server.json"
+    registry = json.loads(manifest_path.read_text())
+    doc = client.get("/.well-known/mcp/server-card.json").json()
+
+    assert doc["name"] == registry["name"]
+    ((card_remote,), (registry_remote,)) = (doc["remotes"], registry["remotes"])
+    assert card_remote["url"] == registry_remote["url"]
+    assert card_remote["type"] == registry_remote["type"]
+    assert doc["websiteUrl"] == registry["websiteUrl"]
