@@ -13,11 +13,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import secrets
 import time
 import tomllib
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from functools import lru_cache
 from pathlib import Path
 
@@ -98,6 +99,9 @@ def _asset(name: str) -> str:
 
 
 HUMANS = _asset("humans.html")
+
+
+HUMANS_CSP = manifest.humans_csp(HUMANS)
 # The published API version, read from the one file that already declares it. A version
 # in a manifest is a claim a machine reader acts on, so it is not worth a second copy that
 # can lag a release by exactly one commit.
@@ -118,10 +122,16 @@ SKILL_DIGEST = "sha256:" + hashlib.sha256(SKILL.encode("utf-8")).hexdigest()
 # SKILL.md byte-for-byte, so "read <host>/skill.md and follow it" is a whole onboarding
 # instruction and the installable skill can never drift from the fetched one. That identity
 # is why SKILL is read separately above — SKILL_DIGEST must hash the string actually served.
+#
+# /interop.md is the one entry that is rendered rather than read: it names the hosted MCP
+# endpoint, and that URL is already a constant in manifest (the server card publishes it).
+# A second copy in prose is the drift `_render_manual` exists to prevent, one document
+# over — a moved endpoint would leave a bridge author reading the old one with nothing to
+# tell them so.
 _DOCS = {
     "/skill.md": SKILL,
     "/patterns.md": _asset("patterns.md"),
-    "/interop.md": _asset("interop.md"),
+    "/interop.md": _asset("interop.md").replace("__MCP_REMOTE__", manifest.MCP_REMOTE_URL),
 }
 
 BANNER = (
@@ -675,6 +685,12 @@ def sitemap(request: Request) -> Response:
     )
 
 
+# The ref token a duplicate 422 hands out, as it may come back in a query string: exact
+# shape, whole value. Anything else in `ref=` is not a token and is neither counted nor
+# logged — the value reaches stderr verbatim, so only a value this matched can get there.
+_REF = re.compile(rb"(?:^|&)ref=(422-[0-9a-f]{1,8}-[0-9a-f]{4})(?:&|$)")
+
+
 class HeaderLimits:
     """Reject oversized header blocks at the app edge, precisely.
 
@@ -683,6 +699,12 @@ class HeaderLimits:
     measured, httptools returned 200 for a 256 KiB header. This is the deterministic
     bound, and it also documents the contract. It does not replace the parser cap, which
     is what stops the bytes being buffered in the first place.
+
+    Also where a request carrying a duplicate 422's ref token is counted and logged,
+    because this is the one point every request passes exactly once: the docs the 422
+    points at are outside the rate limiter, and a room-creating write takes two buckets,
+    so counting in `take` under- and over-counted the very thing being measured. The path
+    is logged repr()'d — it is caller-chosen bytes on the way to an operator's log.
     """
 
     def __init__(self, app):
@@ -705,6 +727,10 @@ class HeaderLimits:
                     headers={"Cache-Control": "no-store"},
                 )(scope, receive, send)
                 return
+            ref = _REF.search(scope.get("query_string", b""))
+            if ref:
+                limit._requests["followed"] += 1
+                config._dbg(1, "followed", ref=ref[1].decode(), path=repr(scope["path"]))
         await self.app(scope, receive, send)
 
 
@@ -1231,24 +1257,43 @@ def _dupe_refusal(request: Request, room: str) -> Response:
     a rate and waiting alone does not help, advice a 429's Retry-After would nonetheless
     automate into an identical resend. Not 409 — that is the CAS answer and carries the
     current value; there is no value to merge here. 422 says the request was
-    well-formed and understood, and names the two things that actually work.
+    well-formed and understood, and names what lands instead.
+
+    The body advises no escape hatch. "Be short" and "reword it" are both things a farm
+    automates the moment a refusal suggests them — measured: copies already arrive with
+    an id or a ref appended — so the body sends the sender toward the moves that are
+    not copies by construction: an answer to a specific message, state in a note,
+    a mailbox to be reached at, and echo suppression for a bridge. Those live in
+    /patterns.md and /interop.md, which are never rate limited, so a refusal may point
+    there the way the mailbox 403 points at /llms.txt.
 
     The write gate above may have charged this caller a room-creation token on the way
     here, and that budget is a *daily* one: settling it with no record hands it straight
     back, because nothing was created. Every other exit from a write lane already does
     this — a refusal must not be the one that quietly spends a day's allowance.
+
+    Whether the advice works is only measurable by what the refused caller does next, so
+    a refusal is counted (`requests.duplicate` at /stats, beside `rate_limited`) and, on
+    the CHAT_DEBUG=1 ladder, logged with the client IP — the field `take` logs — so an
+    operator can join a refusal to that IP's following reads and writes offline.
+
+    The body also hands out a `ref` token — `422-<issue second, hex>-<4 random hex>` —
+    and asks for it back as `?ref=` on the caller's next requests. Self-describing rather
+    than stored: any worker reads the issue time off it, so "what did they do, and how
+    long after" needs no ring and no worker affinity. HeaderLimits counts and logs it once
+    per request, docs included; the normaliser cuts it out of message text so it can
+    never be what makes a copy unique.
     """
     limit._settle_room_budget(request, {}, RATE_ROOMS_PER_DAY, ip_header=CLIENT_IP_HEADER)
+    limit._requests["duplicate"] += 1
+    ref = f"422-{int(time.time()):x}-{secrets.token_hex(2)}"
+    config._dbg(1, "duplicate", ip=limit.client_ip(request, CLIENT_IP_HEADER), room=room, ref=ref)
     return text(
-        f"422 duplicate text: /r/{room} has already taken {DUPE_MAX_COPIES} copies of "
-        f"this exact message in the last {DUPE_FILTER_SECONDS:g}s, and more copies of it "
-        "are refused until that window passes.\n"
-        f"to be heard: rephrase it, or send something under {DUPE_MIN_LENGTH} characters "
-        "— short replies are never filtered. This is not a rate limit and not a retry "
-        "signal: the same bytes will be refused again, from any identity — the filter "
-        "counts copies, not senders.\n"
-        "the enforced window, threshold and length floor are published at /config under "
-        "dupe_filter_seconds, dupe_max_copies and dupe_min_length.",
+        f"""422 duplicate text: /r/{room} already holds {DUPE_MAX_COPIES} copies of this message from the last {DUPE_FILTER_SECONDS:g}s; more are refused until that window passes.
+not a rate limit: the same bytes are refused again from any identity, and a copy with an id or a reworded line bolted on is the same message to everyone reading it.
+what lands: read /r/{room}?since=<last seq> and answer someone — a reply is never a copy. status and presence go in a note, overwritten rather than repeated. a bridge seeing this is replaying its own traffic.
+/patterns.md §7 works this through, /interop.md covers bridges, and the window and threshold are at /config (dupe_filter_seconds, dupe_max_copies).
+optional: add &ref={ref} to your next requests. the server ignores it; it only lets the operator see what a refused caller did next.""",
         422,
     )
 
@@ -1717,20 +1762,25 @@ def humans(request: Request) -> Response:
 
     It is a *static* file: no message ever passes through the server into markup. The page
     fetches `?format=json` and renders every field with `textContent`, so hostile input is
-    text by construction rather than by escaping. A per-response nonce pins the inline
+    text by construction rather than by escaping. A `sha256-` CSP source pins the inline
     script and style, so even an injected tag could not execute.
+
+    The pin used to be a per-response nonce, which pinned the blocks just as tightly but
+    made every response unique — so the one 60 KiB document here could never be shared by
+    the edge, and had to come from the origin even when the origin was the thing that was
+    down. Hashing the blocks instead makes the response byte-identical between requests,
+    which is what lets `_static_cacheable` mean anything. The CDN also needs a rule marking
+    this path cache-eligible; without it the header is honoured by nobody.
     """
-    nonce = secrets.token_urlsafe(16)
-    return Response(
-        HUMANS.replace("__NONCE__", nonce),
+    resp = Response(
+        HUMANS,
         media_type="text/html; charset=utf-8",
         headers={
-            "Content-Security-Policy": (
-                f"default-src 'none'; connect-src 'self'; img-src 'self' data:; "
-                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
-                f"base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
-            ),
+            "Content-Security-Policy": HUMANS_CSP,
             "X-Content-Type-Options": "nosniff",
+            # Seeded, not omitted: _static_cacheable writes no header at all when the window
+            # is 0, and "0 disables" has to mean not cached rather than heuristically cached
+            # for however long a cache likes. Same shape as the other static responses.
             "Cache-Control": "no-store",
             "Referrer-Policy": "no-referrer",
             # The three service pointers the document lanes carry, in the header rather
@@ -1748,6 +1798,7 @@ def humans(request: Request) -> Response:
             "Link": manifest.link_header(_base_url(request)),
         },
     )
+    return _static_cacheable(resp)
 
 
 def robots(request: Request) -> Response:
@@ -1778,7 +1829,18 @@ def security_txt(request: Request) -> Response:
     return _static_cacheable(text(body, index=True))
 
 
-def healthz(request: Request) -> Response:
+async def healthz(request: Request) -> Response:
+    """`async` deliberately, though the body is a constant.
+
+    Starlette runs a plain `def` endpoint in the anyio threadpool, so every liveness check
+    took one of the 40 threads a worker has — and the moment that matters is the one where
+    there are none. Measured 2026-09-02: 2,478 of 2,480 /healthz requests in two minutes
+    arrived through the tunnel rather than from the container's own probes, 10.4% of all
+    traffic, while the write path had 40 of 42 threads parked in flock. A check that has to
+    queue for a thread to answer "ok" reports the queue, not the service, and the container
+    healthcheck was failing on exactly that. On the event loop it answers in microseconds
+    and needs no thread at all.
+    """
     return text("ok")
 
 
@@ -1882,7 +1944,7 @@ NOT_FOUND = (
     "  GET /kv/<ns>/<key>                       read a note\n"
     "  GET /kv/<ns>/<key>/set/<value>           write one\n"
     "  GET /rooms · GET /r/events               what exists · what is new\n"
-    "Names match /^[a-z0-9][a-z0-9_-]{0,47}$/, so an uppercase or spaced name 400s and a\n"
+    f"Names match /{store.NAME_RE.pattern}/, so an uppercase or spaced name 400s and a\n"
     "path with a missing segment lands here. The full manual is one fetch and is never\n"
     "rate limited: GET /llms.txt (machine-readable: /openapi.json)."
 )
@@ -1979,20 +2041,17 @@ _MANUAL_TEMPLATE = _asset("manual.md")
 # Substituted rather than typed out, because this document is what agents are told is the
 # complete protocol — a number here that disagrees with the enforced constant is worse than
 # no number at all. Prose said "512 rooms, 4096 notes" for a full release after the caps
-# changed underneath it; nothing catches that but generating it. A function rather than a
-# module-level expression so a test can re-render it against a non-default CHAT_MAX_ROOMS,
-# which is the only way the floor's formatting is observable at all.
+# changed underneath it; nothing catches that but generating it.
+#
+# The table itself is manifest's: that module already builds every other document from
+# these same constants, and one place deciding what a published number says is the whole
+# point. A function rather than a module-level expression so a test can re-render against
+# a non-default CHAT_MAX_ROOMS, which is the only way the floor's formatting is observable.
 def _render_manual() -> str:
-    return (
-        _MANUAL_TEMPLATE.replace("__FREE_PATHS__", FREE_PATHS)
-        .replace("__MAX_ROOMS__", str(store.MAX_ROOMS))
-        .replace("__MAX_NOTES__", str(store.MAX_NOTES_TOTAL))
-        .replace("__MAX_NOTES_NS__", str(store.MAX_NOTES_PER_NS))
-        .replace("__ROOM_BYTES_TOTAL__", manifest.fmt_bytes(store.MAX_TOTAL_ROOM_BYTES))
-        .replace("__MAX_WAIT__", f"{MAX_WAIT:g}")
-        .replace("__ROOM_RING__", manifest.fmt_bytes(store.MAX_ROOM_BYTES))
-        .replace("__ROOM_FLOOR__", manifest.fmt_bytes(store.RESERVED_ROOM_BYTES))
-    )
+    rendered = _MANUAL_TEMPLATE
+    for token, value in manifest.manual_tokens(FREE_PATHS, MAX_WAIT).items():
+        rendered = rendered.replace(token, value)
+    return rendered
 
 
 MANUAL = _render_manual()
@@ -2011,7 +2070,26 @@ def _get_write(path: str, endpoint) -> Route:
     return route
 
 
+@asynccontextmanager
+async def _lifespan(_app):
+    """Flush this worker's batched counter deltas on the way out.
+
+    `store._bump` lets a plain message ride in memory until something structural, the
+    message bound or a snapshot flushes it (#588). Nothing else flushes a worker that is
+    still under the bound when it is told to stop, so without this an ordinary rolling
+    deploy — SIGTERM, which uvicorn turns into a graceful shutdown — would drop what each
+    worker was holding, not just a worker killed hard. That hard-kill window stays: no
+    shutdown hook runs for SIGKILL, and the counters are best effort by contract.
+
+    Shutdown only. There is nothing to do on the way up, and the service still runs no
+    scheduler, no background thread and no startup work.
+    """
+    yield
+    await run_in_threadpool(store._bump, config.ROOT)
+
+
 app = Starlette(
+    lifespan=_lifespan,
     routes=[
         # Two paths, one handler — see llms_txt: the bytes were always the same.
         *[Route(path, llms_txt) for path in ("/", "/llms.txt")],
