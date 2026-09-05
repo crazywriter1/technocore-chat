@@ -538,6 +538,7 @@ def test_the_two_write_note_conditions_are_sent_together_so_that_service_can_ref
         "if": "current",
     }
 
+
 def test_discovery_and_room_listing_reach_their_lanes(mcp):
     mcp.call("say", {"room": "meta", "text": "hi", "nick": "bot"})
     assert "meta" in text_of(mcp.call("discover_rooms", {}))
