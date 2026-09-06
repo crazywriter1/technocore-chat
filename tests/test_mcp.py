@@ -455,6 +455,8 @@ def test_note_value_strips_banner_and_budget_footer():
     # A body that is not framed (defensive): leave it alone rather than eat content.
     assert _note_value("plain") == "plain"
     assert _note_value("# budget: bare") == "# budget: bare"
+
+
 def test_list_notes_bounds_a_large_namespace_and_says_what_it_dropped(mcp, tmp_path):
     """#698: /kv/<ns> has no limit of its own, so an unbounded listing put the whole
     namespace in one tool result — 3.2 MB for `did` at its cap. The bound is the
